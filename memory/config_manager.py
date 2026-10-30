@@ -150,6 +150,25 @@ def save_hud_style(style: str) -> None:
     _save_flag("hud_style", s if s in HUD_STYLES else "face")
 
 
+def get_activity_scenes_enabled() -> bool:
+    """Whether the HUD swaps the face for an animated scene while JARVIS works
+    (searching, weather, reminders...). On by default; set
+    "activity_scenes": false in config/api_keys.json to always show the face."""
+    return bool(load_api_keys().get("activity_scenes", True))
+
+
+def get_reply_language() -> str:
+    """The one language JARVIS always answers in, or "" to follow the user.
+
+    Defaults to English: speech-recognition guesses on short or noisy phrases
+    were making the assistant switch language mid-conversation. Set
+    "reply_language": "" in config/api_keys.json to go back to following
+    whatever language the user speaks, or name another language to lock to it.
+    """
+    v = load_api_keys().get("reply_language", "English")
+    return str(v if v is not None else "").strip()
+
+
 # ── Live-session tuning ──────────────────────────────────────────────────────
 # Everything here is optional and has a working default, so an untouched
 # config behaves exactly like a configured one. Each value is also a way out:
