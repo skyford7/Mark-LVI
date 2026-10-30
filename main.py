@@ -363,6 +363,17 @@ def _clean_transcript(text: str) -> str:
     text = re.sub(r"[\x00-\x08\x0b-\x1f]", "", text)
     return text.strip()
 
+
+def _locked_language() -> str:
+    """The language every reply must be in, or "" to follow the user.
+    See get_reply_language() in memory/config_manager.py (default: English)."""
+    try:
+        from memory.config_manager import get_reply_language
+        return get_reply_language()
+    except Exception:
+        return ""
+
+
 TOOL_DECLARATIONS = [
     # ── Inline tools ─────────────────────────────────────────────────────────
     # These stay here (rather than in an actions/*.py TOOL dict) because their
@@ -1174,6 +1185,18 @@ class JarvisLive:
             parts.append(mem_str)
         parts.append(sys_prompt)
 
+        _lock = _locked_language()
+        if _lock:
+            parts.append(
+                f"\n[LANGUAGE LOCK — THIS OVERRIDES THE [LANGUAGE] SECTION ABOVE]\n"
+                f"Always speak {_lock}, in every reply, for the whole conversation. "
+                f"The user speaks {_lock}. If what you heard sounds like another "
+                f"language, you misheard it: treat it as {_lock} and answer in "
+                f"{_lock}. Never reply in any other language, never mix languages, "
+                f"and ignore any language stored in memory. Switch only if the user "
+                f"clearly asks you to, in {_lock}, to speak a different language.\n"
+            )
+
         cfg = dict(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
@@ -1284,6 +1307,10 @@ class JarvisLive:
 
         print(f"[JARVIS] 🔧 {name}  {args}")
         self.ui.set_state("THINKING")
+        # Swap the HUD's face for this action's scene (core/activity_scenes.py).
+        _show = getattr(self.ui, "show_tool_activity", None)
+        if _show:
+            _show(name, args)
 
 
         if name == "save_memory":
@@ -1685,6 +1712,11 @@ class JarvisLive:
                                 # alone cannot show. Pure string work — it adds
                                 # nothing measurable to the response path.
                                 self._visemes.feed_text(txt)
+                                # What he is saying can choose a HUD scene too
+                                # (weather talk shows the weather, and so on).
+                                _hint = getattr(self.ui, "speech_hint", None)
+                                if _hint:
+                                    _hint(" ".join(out_buf))
 
                         if sc.input_transcription and sc.input_transcription.text:
                             txt = _clean_transcript(sc.input_transcription.text)
@@ -1703,6 +1735,9 @@ class JarvisLive:
                                 in_buf  = []
                                 out_buf = []
                                 self._visemes.reset()
+                                _rst = getattr(self.ui, "reset_speech_hint", None)
+                                if _rst:
+                                    _rst()
                                 continue
 
                             full_in = " ".join(in_buf).strip()
@@ -1719,6 +1754,9 @@ class JarvisLive:
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
+                            _rst = getattr(self.ui, "reset_speech_hint", None)
+                            if _rst:
+                                _rst()
                             # Second line of defence: even if a repeat slips
                             # into a *fresh* buffer after a flush, never log the
                             # same answer (or a tail of it) twice in a row.
@@ -1914,7 +1952,7 @@ class JarvisLive:
             e = identity.get(k, {})
             return (e.get("value", "") if isinstance(e, dict) else str(e)).strip()
 
-        lang = _val("language")
+        lang = _locked_language() or _val("language")
         name = _val("name")
         time_str = datetime.now().strftime("%H:%M")
 
@@ -1930,7 +1968,9 @@ class JarvisLive:
         # The briefing fires before the user has said anything, so the
         # remembered language is the only signal there is. It is a starting
         # point, not a setting: the moment they reply, their language wins.
-        lang_clause = (f" Speak this greeting in {lang}, then follow the "
+        _locked = bool(_locked_language())
+        lang_clause = (f" Speak this greeting in {lang}." if _locked else
+                       f" Speak this greeting in {lang}, then follow the "
                        f"user's own language from their first reply onward."
                        if lang else "")
         name_clause = f" Address the user as {name}." if name else ""
@@ -1966,7 +2006,8 @@ class JarvisLive:
         # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
         async def _deliver_news():
             try:
-                lang_str = (f" Speak in {lang} unless the user has since "
+                lang_str = (f" Speak in {lang}." if _locked else
+                            f" Speak in {lang} unless the user has since "
                             f"spoken another language, in which case use theirs."
                             if lang else "")
 
@@ -2044,7 +2085,7 @@ class JarvisLive:
         memory = load_memory()
         lang_entry = memory.get("identity", {}).get("language", {})
         lang = (lang_entry.get("value", "") if isinstance(lang_entry, dict) else str(lang_entry)).strip()
-        lang = lang or "English"
+        lang = _locked_language() or lang or "English"
 
         convo = "\n".join(log[-40:])   # cap at last 40 turns to stay within token budget
         prompt = (

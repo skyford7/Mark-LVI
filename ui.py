@@ -61,6 +61,11 @@ try:
 except Exception:      # pragma: no cover — HUD must never die over cosmetics
     HoloAvatar = None
 
+try:
+    from core import activity_scenes as _scenes
+except Exception:      # pragma: no cover — scenes are cosmetic; the face still works
+    _scenes = None
+
 
 def _base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -464,9 +469,69 @@ class HudCanvas(QWidget):
         self._base_scale = 1.0    # slow "breathing" target; amp is added per-frame
         self._base_halo  = 55.0
 
+        # Activity scenes (core/activity_scenes.py): while JARVIS performs an
+        # action, or talks about something with a scene of its own, the
+        # centrepiece cross-fades from the face to that scene and back.
+        try:
+            from memory.config_manager import get_activity_scenes_enabled
+            self.scenes_enabled = bool(get_activity_scenes_enabled()) and _scenes is not None
+        except Exception:
+            self.scenes_enabled = _scenes is not None
+        self._scene: str | None = None      # kind currently shown (or fading out)
+        self._scene_label = ""
+        self._scene_prio  = 0               # 2 = tool call, 1 = speech keyword
+        self._scene_until = 0.0             # wall-clock time it may start fading
+        self._scene_start = 0.0
+        self._scene_a     = 0.0             # 0 = face only, 1 = scene only
+
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
         self._tmr.start(16)
+
+    # Longest a single scene may stay up, however long the talking goes on, so
+    # a missed "done" can never leave the face hidden for good.
+    _SCENE_MAX_S  = 60.0
+    # How long a scene lingers after the work and the talking have both stopped.
+    _SCENE_HOLD_S = 2.5
+
+    def set_activity(self, kind: str, label: str = "", prio: int = 2) -> None:
+        """Show activity scene `kind` (GUI thread). A weaker signal never
+        replaces a stronger one that is still on screen: what a tool is doing
+        outranks a keyword in what JARVIS happens to be saying."""
+        if not self.scenes_enabled or _scenes is None or kind not in _scenes.SCENES:
+            return
+        now = time.time()
+        showing = self._scene is not None and now < self._scene_until
+        if showing and prio < self._scene_prio and kind != self._scene:
+            return
+        if kind != self._scene or not showing:
+            self._scene_start = now
+            if self._scene is not None and kind != self._scene:
+                self._scene_a = min(self._scene_a, 0.35)   # quick swap, not a pop
+        self._scene = kind
+        self._scene_label = label or _scenes.SCENES[kind][1]
+        self._scene_prio = prio
+        self._scene_until = now + self._SCENE_HOLD_S
+
+    def clear_activity(self) -> None:
+        """Let the current scene fade back to the face straight away."""
+        self._scene_until = 0.0
+
+    def _step_scene(self, dt: float, now: float) -> None:
+        if self._scene is None:
+            return
+        busy = self.speaking or self.state in ("THINKING", "PROCESSING")
+        if busy and now - self._scene_start < self._SCENE_MAX_S:
+            self._scene_until = max(self._scene_until, now + self._SCENE_HOLD_S)
+        target = 1.0 if now < self._scene_until else 0.0
+        rate = dt / 0.35                       # ~0.35 s cross-fade
+        if self._scene_a < target:
+            self._scene_a = min(target, self._scene_a + rate)
+        else:
+            self._scene_a = max(target, self._scene_a - rate)
+        if target == 0.0 and self._scene_a <= 0.0:
+            self._scene = None
+            self._scene_prio = 0
 
     def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
         """Ask the avatar to look somewhere for a moment (see HoloAvatar.glance)."""
@@ -605,6 +670,7 @@ class HudCanvas(QWidget):
         # a rate that changes with state jumps the rings the instant JARVIS
         # starts talking. Same lesson the head's sway taught.
         self._core_phase += min(0.10, max(0.0, dt))
+        self._step_scene(min(0.10, max(0.0, dt)), now)
 
         if self._avatar is not None and self.hud_style == "face":
             self._avatar.step(dt, amp, speaking=self.speaking,
@@ -654,7 +720,7 @@ class HudCanvas(QWidget):
         # so a sleeping HUD stops pinning a CPU core. The visuals stay smooth
         # either way because the animation state keeps stepping at 60 Hz.
         self._paint_tick = (self._paint_tick + 1) % 6
-        active = (self.speaking or amp > 0.02
+        active = (self.speaking or amp > 0.02 or self._scene is not None
                   or self.state in ("THINKING", "PROCESSING"))
         if _blinked or (self._paint_tick % 2 == 0 if active
                         else self._paint_tick % 3 == 0):
@@ -863,7 +929,16 @@ class HudCanvas(QWidget):
         # capped by width, so it fills the HUD at any window size — including
         # fullscreen — without ever colliding with the status text below.
         _sy_status = cy + fw * 0.40
-        if self._avatar is not None and self.hud_style == "face":
+
+        # Cross-fade between the usual centrepiece and an activity scene. At
+        # full strength the face is skipped entirely, so a scene costs no more
+        # to draw than the head it replaces.
+        _sa = self._scene_a if self._scene is not None else 0.0
+        if _sa > 0.0:
+            p.setOpacity(max(0.0, 1.0 - _sa))
+        if _sa >= 0.999:
+            pass
+        elif self._avatar is not None and self.hud_style == "face":
             _band_t = 12.0
             _band_h = max(60.0, _sy_status - 12.0 - _band_t)
             _r_head = min(fw * 0.355, _band_h / (self._avatar.SPAN + 0.08))
@@ -893,10 +968,26 @@ class HudCanvas(QWidget):
             _r = min(W * 0.46, _band_h / 2.0)
             self._paint_core(p, cx, _band_t + _band_h / 2.0, _r, W, _band_h)
 
+        if _sa > 0.0:
+            p.setOpacity(min(1.0, _sa))
+            _band_t = 12.0
+            _band_h = max(60.0, _sy_status - 12.0 - _band_t)
+            _r = min(W * 0.46, _band_h / 2.0)
+            _scenes.paint_scene(p, self._scene, cx, _band_t + _band_h / 2.0, _r,
+                                self._core_phase, self._amp_disp, qcol(C.BG))
+        p.setOpacity(1.0)
+
         # status text
         sy = _sy_status
+        _scene_on = self._scene is not None and _sa > 0.5 and not self.muted
         if self.muted:
             txt, col = "⊘  MUTED",     qcol(C.MUTED_C)
+        elif _scene_on:
+            sym = "◈" if self._blink else "◇"
+            if self.speaking:
+                sym = "●"
+            txt = f"{sym}  {self._scene_label}"
+            col = _scenes.scene_colour(self._scene)
         elif self.speaking:
             txt, col = "●  SPEAKING",  qcol(C.ACC)
         elif self.state == "THINKING":
@@ -4253,6 +4344,7 @@ class MainWindow(QMainWindow):
     _quiz_sig       = pyqtSignal(str, object, object)  # (topic, questions, grader)
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
+    _activity_sig   = pyqtSignal(str, str, int)  # (scene kind, label, priority)
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -4520,6 +4612,7 @@ class MainWindow(QMainWindow):
 
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
+        self._activity_sig.connect(self.hud.set_activity)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
         self._camera_sig.connect(self._show_camera_frame)
@@ -7097,6 +7190,39 @@ class JarvisUI:
 
     def set_state(self, state: str):
         self._win._state_sig.emit(state)
+
+    # ── activity scenes ──────────────────────────────────────────────────────
+    # Thread-safe: both are called from the assistant's asyncio thread and only
+    # ever emit a signal, so the HUD itself is touched on the GUI thread.
+    _last_speech_scene = None
+
+    def show_tool_activity(self, name: str, args=None) -> None:
+        """Switch the HUD to the scene for the tool that is about to run."""
+        try:
+            if _scenes is None:
+                return
+            hit = _scenes.scene_for_tool(name, args or {})
+            if hit:
+                self._last_speech_scene = None
+                self._win._activity_sig.emit(hit[0], hit[1], 2)
+        except Exception:
+            pass
+
+    def speech_hint(self, text: str) -> None:
+        """Offer what JARVIS is saying right now as a (weak) scene hint."""
+        try:
+            if _scenes is None:
+                return
+            hit = _scenes.scene_for_speech(text)
+            if hit and hit[0] != self._last_speech_scene:
+                self._last_speech_scene = hit[0]
+                self._win._activity_sig.emit(hit[0], hit[1], 1)
+        except Exception:
+            pass
+
+    def reset_speech_hint(self) -> None:
+        """Forget the last speech scene so the next reply can show it again."""
+        self._last_speech_scene = None
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
