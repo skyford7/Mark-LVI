@@ -48,6 +48,7 @@ SCENES: dict[str, tuple[str, str]] = {
     "news":     ("#ff9e40", "NEWS"),
     "alert":    ("#ff6b35", "ATTENTION"),
     "greet":    ("#ffd166", "GOOD TO SEE YOU"),
+    "image":    ("#ff7ac6", "CREATING AN IMAGE"),
 }
 
 # Tool name -> scene kind. Anything not listed falls through to keyword
@@ -68,6 +69,7 @@ _TOOL_SCENES: dict[str, str] = {
     "system_status": "system", "manage_monitor": "system",
     "flight_finder": "travel",
     "shutdown_jarvis": "alert",
+    "generate_image": "image", "edit_image": "image",
 }
 
 # Tools that happen silently in the background; showing a scene for them
@@ -75,6 +77,7 @@ _TOOL_SCENES: dict[str, str] = {
 _SILENT_TOOLS = {"save_memory"}
 
 _NAME_HINTS = (
+    (("image", "picture", "draw", "paint", "photo"), "image"),
     (("music", "spotify", "song", "audio", "youtube", "video"), "media"),
     (("mail", "gmail", "whatsapp", "chat", "message", "sms"), "message"),
     (("calendar", "remind", "alarm", "timer", "clock"), "time"),
@@ -96,6 +99,7 @@ _LABEL_OVERRIDES = {
     "send_message": "SENDING A MESSAGE",
     "file_processor": "READING A FILE",
     "shutdown_jarvis": "POWER ACTION",
+    "edit_image": "OPENING THE IMAGE EDITOR",
 }
 
 
@@ -641,11 +645,46 @@ def _greet(c: _Ctx):
         p.drawLine(QLineF(cx - w, hy + k * R * 0.12, cx + w, hy + k * R * 0.12))
 
 
+def _image(c: _Ctx):
+    p, cx, cy, R = c.p, c.cx, c.cy, c.r * 0.55
+    # canvas on an easel
+    rect = QRectF(cx - R * 0.70, cy - R * 0.62, R * 1.40, R * 1.0)
+    c.pen(c.acc, 0.6, 2.0)
+    p.drawLine(QLineF(cx - R * 0.45, rect.bottom(), cx - R * 0.62, cy + R * 0.80))
+    p.drawLine(QLineF(cx + R * 0.45, rect.bottom(), cx + R * 0.62, cy + R * 0.80))
+    p.setBrush(QBrush(c.mix(QColor("#ffffff"), 0.10)))
+    c.pen(c.acc, 0.9, 2.0)
+    p.drawRect(rect)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    # a stroke being painted across the canvas, left to right, then again
+    prog = (c.t * 0.35) % 1.0
+    cols = [QColor("#ff7ac6"), QColor("#7ad7ff"), QColor("#ffd166")]
+    for k, col in enumerate(cols):
+        path = QPainterPath()
+        n = 40
+        y0 = rect.top() + rect.height() * (0.28 + k * 0.24)
+        for i in range(int(n * min(1.0, prog * 1.25 - k * 0.12)) + 1):
+            x = rect.left() + R * 0.12 + i / n * (rect.width() - R * 0.24)
+            y = y0 + math.sin(i / n * 6.0 + k) * R * 0.08
+            (path.lineTo if i else path.moveTo)(x, y)
+        p.setPen(QPen(c.mix(col, 0.9), max(2.0, R * 0.06),
+                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawPath(path)
+    # sparkles that twinkle around the canvas
+    p.setPen(Qt.PenStyle.NoPen)
+    for i, (ox, oy) in enumerate(((-0.85, -0.75), (0.88, -0.55), (0.80, 0.55), (-0.90, 0.35))):
+        tw = max(0.0, math.sin(c.t * 3.0 + i * 1.7))
+        p.setBrush(QBrush(c.mix(QColor("#ffffff"), 0.3 + 0.7 * tw)))
+        c.circle(cx + ox * R, cy + oy * R, R * (0.02 + 0.03 * tw))
+    p.setBrush(Qt.BrushStyle.NoBrush)
+
+
 _PAINTERS = {
     "web": _web, "weather": _weather, "apps": _apps, "settings": _settings,
     "media": _media, "files": _files, "time": _time, "message": _message,
     "vision": _vision, "code": _code, "memory": _memory, "system": _system,
     "travel": _travel, "news": _news, "alert": _alert, "greet": _greet,
+    "image": _image,
 }
 
 
