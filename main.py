@@ -303,6 +303,12 @@ def _describe_limits(has_vision: bool, has_mic: bool) -> str:
             "- Your sight is not continuous. You see nothing until you call a "
             "vision tool, and then only that single frame at that moment — you "
             "cannot watch, monitor or notice something changing on screen.")
+        out.append(
+            "- A picture labelled [IMAGE SOURCE: UPLOADED FILE] is a file the "
+            "user dropped into the app. It is attached to the conversation, so "
+            "answer questions about it by looking at it directly — never use the "
+            "webcam or a screen capture for it, and only call file_processor on "
+            "it to change the file itself (resize, convert, compress).")
     else:
         out.append("- You have no sight at all in this build.")
     if has_mic:
@@ -946,13 +952,67 @@ class JarvisLive:
         if self._wake_enabled and not self._awake:
             self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
             return
+        parts = self._upload_parts(text) or [{"text": text}]
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
-                turns={"role": "user", "parts": [{"text": text}]},
+                turns={"role": "user", "parts": parts},
                 turn_complete=True
             ),
             self._loop
         )
+
+    _UPLOAD_RX = re.compile(r"^\[FILE_UPLOADED\] path=(?P<path>.+?) \| name=(?P<name>.+?) \|")
+    _UPLOAD_IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+    _UPLOAD_MAX_SIDE = 1536
+
+    def _upload_parts(self, text: str):
+        """When the user drops an IMAGE into the app, attach the picture itself.
+
+        The upload used to reach the model as a line of text naming the file,
+        so seeing it depended on the model choosing to call file_processor —
+        and it often did not: it answered blind, or reached for the webcam and
+        reported "the camera feed is dark". Sending the pixels with the notice
+        lets the model simply look, the same way screen_process frames arrive.
+        Returns None for anything that is not an image, or when the engine in
+        use cannot see, so those keep the old text-only path.
+        """
+        m = self._UPLOAD_RX.match(text or "")
+        if not m:
+            return None
+        path = Path(m.group("path"))
+        if path.suffix.lower() not in self._UPLOAD_IMG_EXT or not path.is_file():
+            return None
+        caps = self._engine_caps
+        if caps is not None and not caps.get("vision"):
+            return None
+        try:
+            import base64 as _b64
+            import io as _io
+            from PIL import Image
+            with Image.open(path) as im:
+                im.seek(0)                        # first frame of a GIF
+                im = im.convert("RGB")
+                im.thumbnail((self._UPLOAD_MAX_SIDE, self._UPLOAD_MAX_SIDE))
+                buf = _io.BytesIO()
+                im.save(buf, format="JPEG", quality=85)
+            data = buf.getvalue()
+        except Exception as e:
+            print(f"[Upload] could not attach {path.name}: {e}")
+            return None
+        name = m.group("name")
+        print(f"[Upload] 🖼️  {name}: {len(data):,} bytes attached to the session")
+        note = (
+            f"[IMAGE SOURCE: UPLOADED FILE] The user just uploaded the picture "
+            f"'{name}' — it is attached above, so you can see it directly. "
+            f"Briefly say you can see it (one short sentence on what it shows) and "
+            f"ask what they would like to know or do with it. Answer any question "
+            f"about it by looking at this attached image. Do NOT call screen_process "
+            f"(webcam or screen) for it. Only call file_processor on '{path}' if they "
+            f"want the file itself changed (resize, convert, compress)."
+        )
+        return [{"inline_data": {"mime_type": "image/jpeg",
+                                 "data": _b64.b64encode(data).decode("ascii")}},
+                {"text": note}]
 
     def _tail_active(self) -> bool:
         """True while the speakers may still be finishing our last sentence."""
