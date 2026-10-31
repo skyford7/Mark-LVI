@@ -82,6 +82,27 @@ _MIC_FLOOR = 0.14
 # at any speaker volume.
 _CLOSE_FRAC = 0.10
 
+# ── emotion ──────────────────────────────────────────────────────────────────
+# A handful of named feelings, each a target for four controls the renderer
+# already (almost) has: a smile curve on the lips, an extra brow lift, an eye
+# widen/narrow, and a head tilt. The face blends toward whichever one the
+# conversation calls for, so "happy" and "concerned" are a few numbers apart
+# rather than separate code paths. Values are deliberately gentle: a hologram
+# that grins ear to ear stops reading as an assistant.
+#   smile  : -1 frown .. +1 smile (lip-corner lift)
+#   browup : extra brow raise (surprise/attention); negative knits them down
+#   lids   : >0 widen the eyes, <0 soften/narrow them
+#   tilt   : head roll in radians, + tilts the head to one side
+EMOTIONS: dict[str, dict[str, float]] = {
+    "neutral":   {"smile": 0.00, "browup":  0.00, "lids":  0.00, "tilt":  0.00},
+    "happy":     {"smile": 1.00, "browup":  0.15, "lids": -0.10, "tilt":  0.06},
+    "pleased":   {"smile": 0.55, "browup":  0.08, "lids": -0.05, "tilt":  0.04},
+    "thinking":  {"smile":-0.10, "browup": -0.22, "lids": -0.04, "tilt":  0.11},
+    "concerned": {"smile":-0.55, "browup":  0.30, "lids":  0.04, "tilt": -0.07},
+    "surprised": {"smile": 0.20, "browup":  0.95, "lids":  0.45, "tilt":  0.00},
+}
+_EMO_KEYS = ("smile", "browup", "lids", "tilt")
+
 
 def _rate(dt: float, tau: float) -> float:
     """Per-frame lerp factor for an exponential approach with time constant
@@ -192,6 +213,15 @@ class HoloAvatar:
         self._brow_bias = 0.0      # concentration pulls the brows down
         self._glance = None        # (dx, dy, until_t) — a deliberate look
 
+        # ── emotion ──────────────────────────────────────────────────────────
+        # `_emo` is the live, smoothed blend the renderer reads; `_emo_hint` is
+        # a feeling the conversation asked for (set_emotion), good until its
+        # deadline, after which the face falls back to what its state implies.
+        self._roll = 0.0
+        self._emo = {k: 0.0 for k in _EMO_KEYS}
+        self._emo_hint = None
+        self._emo_hint_at = 0.0
+
         # ── viseme ──────────────────────────────────────────────────────────
         # Loudness alone only answers "how far open", which is why an RMS-driven
         # mouth flaps rather than speaks. These two carry the *shape*: how open
@@ -277,6 +307,11 @@ class HoloAvatar:
         self._yaw = 0.26 * math.sin(s * 0.31) + 0.09 * math.sin(s * 0.73 + 1.3)
         self._pitch = (0.060 * math.sin(s * 0.23 + 0.7)
                        + 0.024 * math.sin(s * 0.61))
+        # Head roll — a gentle idle tilt, plus whatever the current emotion
+        # leans toward. A tilting head is most of what separates "alive" from
+        # "mannequin", and it costs one more term in the pose matrix.
+        roll_idle = 0.045 * math.sin(s * 0.27 + 0.4)
+        self._roll += ((roll_idle + self._emo["tilt"]) - self._roll) * 0.05
 
         # Mouth. Which level is driving it matters more than any rate here.
         #
@@ -333,13 +368,30 @@ class HoloAvatar:
             self._expr_at = t + 0.8
         self._expr += (self._expr_tgt - self._expr) * 0.075
 
-        brow_t = 0.55 * self._amp_slow + 0.60 * self._expr + self._brow_bias
+        brow_t = (0.55 * self._amp_slow + 0.60 * self._expr
+                  + self._brow_bias + 0.55 * self._emo["browup"])
         self._brow += (max(-0.4, min(1.2, brow_t)) - self._brow) * 0.20
 
         # ── what the state does to the face ─────────────────────────────────
         st = (state or "").upper()
         thinking = st in ("THINKING", "PROCESSING")
         asleep = st in ("SLEEPING", "STANDBY", "OFFLINE")
+
+        # Which feeling the face is wearing: a strong state decides it, else the
+        # conversation's hint (set_emotion) while it is still fresh, else calm.
+        if asleep:
+            emo_name = "neutral"
+        elif thinking:
+            emo_name = "thinking"
+        elif self._emo_hint is not None and t < self._emo_hint_at:
+            emo_name = self._emo_hint
+        elif live:
+            emo_name = "pleased"      # engaged while speaking, lightly
+        else:
+            emo_name = "neutral"
+        tgt = EMOTIONS.get(emo_name, EMOTIONS["neutral"])
+        for k in _EMO_KEYS:
+            self._emo[k] += (tgt[k] - self._emo[k]) * 0.07
 
         if thinking:
             # People look away to think, and hold it. The direction re-rolls
@@ -361,6 +413,7 @@ class HoloAvatar:
 
         for i in (0, 1):
             self._gaze_bias[i] += (self._bias_tgt[i] - self._gaze_bias[i]) * 0.06
+        lid_tgt = max(0.0, min(1.35, lid_tgt + 0.5 * self._emo["lids"]))
         self._lids += (lid_tgt - self._lids) * 0.08
         self._brow_bias += (brow_bias - self._brow_bias) * 0.06
 
@@ -415,6 +468,23 @@ class HoloAvatar:
                 gap = 5.5 if thinking else 3.4
                 self._blink_at = t + gap + 3.1 * random.random()
 
+    def set_emotion(self, name: str, hold: float = 4.0) -> None:
+        """Ask the face to wear an emotion for `hold` seconds.
+
+        A hint, not a command: a strong state (thinking, asleep) still wins, and
+        once the hold lapses the face returns to what its state implies. Unknown
+        names clear the hint. Never raises — a bad call must not freeze the HUD.
+        """
+        try:
+            name = str(name or "").lower().strip()
+            if name in EMOTIONS and name != "neutral":
+                self._emo_hint = name
+                self._emo_hint_at = self._t + max(0.3, float(hold))
+            else:
+                self._emo_hint = None
+        except Exception:
+            self._emo_hint = None
+
     def glance(self, dx: float, dy: float, hold: float = 1.1) -> None:
         """Look deliberately somewhere for `hold` seconds, then wander again.
 
@@ -447,6 +517,16 @@ class HoloAvatar:
             v[:, 1] += k * (v[:, 1] - self._lip_c[1]) * 0.30
             v[:, 2] -= k * 0.055
 
+        smile = self._emo["smile"]
+        if abs(smile) > 0.01:
+            # Corners rise (or fall) with horizontal distance from the lip
+            # centre, so the middle of the mouth barely moves and the ends sweep
+            # up into a curve. Weighted by the lip mask, it touches nothing else.
+            dx = v[:, 0] - self._lip_c[0]
+            v[:, 1] += self._lips_w * (smile * 0.80) * np.abs(dx)
+            # A smile also plumps the cheeks forward a hair; a frown pulls in.
+            v[:, 2] += self._lips_w * (smile * 0.012)
+
         if self._mouth > 0.004:
             px, py, pz = JAW_PIVOT
             ang = self._jaw * (self._mouth * JAW_MAX)
@@ -463,6 +543,13 @@ class HoloAvatar:
             [sp * sy, cp, -sp * cy],
             [-cp * sy, sp, cp * cy],
         ], dtype=np.float32)
+
+        if abs(self._roll) > 1e-3:
+            cr, sr = math.cos(self._roll), math.sin(self._roll)
+            rz = np.array([[cr, -sr, 0.0],
+                           [sr,  cr, 0.0],
+                           [0.0, 0.0, 1.0]], dtype=np.float32)
+            m = rz @ m
 
         return v @ m.T, self._n0 @ m.T
 
@@ -490,14 +577,29 @@ class HoloAvatar:
         verts, norms = self._pose()
 
         # ── aura ────────────────────────────────────────────────────────────
-        ar = r * 1.95
+        # Two layers now: a wide soft body of light, and a brighter ring hugging
+        # the head — the rim glow is what sells a projection hovering in air
+        # rather than a model sitting on black. A slow breath makes it live.
+        breath = 0.5 + 0.5 * math.sin(self._t * 1.6)
+        ar = r * 2.05
         grad = QRadialGradient(cx, cy, ar)
-        grad.setColorAt(0.00, _c(primary, 34 + 66 * amp))
-        grad.setColorAt(0.38, _c(primary, 20 + 40 * amp))
+        grad.setColorAt(0.00, _c(primary, 40 + 70 * amp))
+        grad.setColorAt(0.30, _c(primary, 22 + 46 * amp))
+        grad.setColorAt(0.74, _c(accent, 10 + 26 * amp))
         grad.setColorAt(1.00, _c(primary, 0))
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(grad))
         p.drawEllipse(QRectF(cx - ar, cy - ar, ar * 2, ar * 2))
+
+        # Rim halo: a tight bright ring just outside the silhouette.
+        rr = r * 1.30
+        rim = QRadialGradient(cx, cy, rr)
+        rim.setColorAt(0.00, _c(primary, 0))
+        rim.setColorAt(0.80, _c(primary, 0))
+        rim.setColorAt(0.93, _c(accent, 34 + 46 * amp + 22 * breath))
+        rim.setColorAt(1.00, _c(primary, 0))
+        p.setBrush(QBrush(rim))
+        p.drawEllipse(QRectF(cx - rr, cy - rr, rr * 2, rr * 2))
 
         # ── project ─────────────────────────────────────────────────────────
         w = _CAM_D - verts[:, 2]
@@ -645,7 +747,10 @@ class HoloAvatar:
             return
 
         lm = self._lm
-        vis = 1.0 - self._blink
+        # Openness is the blink AND the lids (state + emotion): a drowsy face
+        # half-closes, a surprised one opens past normal. `_lids` was computed
+        # for exactly this but had never been wired to the drawing.
+        vis = max(0.0, (1.0 - self._blink)) * max(0.0, min(1.3, self._lids))
 
         # ── eyes ────────────────────────────────────────────────────────────
         for key in ("eye_l", "eye_r"):
@@ -670,10 +775,23 @@ class HoloAvatar:
                 cpt = QPointF(gx, gy)
                 rad = min(br.height() * 0.62, br.width() * 0.20)
                 p.setPen(Qt.PenStyle.NoPen)
-                p.setBrush(QBrush(_c(accent, (70 + 60 * amp) * face * vis)))
+                # Soft glow halo first, so the iris looks lit from within rather
+                # than painted on — the single clearest "hologram" tell on the
+                # face. It brightens as JARVIS speaks.
+                hr = rad * (2.1 + 0.7 * amp)
+                halo = QRadialGradient(cpt, hr)
+                halo.setColorAt(0.0, _c(accent, (90 + 90 * amp) * face * vis))
+                halo.setColorAt(1.0, _c(accent, 0))
+                p.setBrush(QBrush(halo))
+                p.drawEllipse(cpt, hr, hr * vis)
+                p.setBrush(QBrush(_c(accent, (90 + 70 * amp) * face * vis)))
                 p.drawEllipse(cpt, rad, rad * vis)            # iris
-                p.setBrush(QBrush(_c(accent, 245 * face * vis)))
+                p.setBrush(QBrush(_c(accent, 255 * face * vis)))
                 p.drawEllipse(cpt, rad * 0.42, rad * 0.42 * vis)   # pupil
+                # A tiny white catch-light makes the eye wet and alive.
+                p.setBrush(QBrush(_c(QColor(255, 255, 255), 210 * face * vis)))
+                p.drawEllipse(QPointF(gx - rad * 0.18, gy - rad * 0.22),
+                              rad * 0.16, rad * 0.16 * vis)
 
         # ── brows ───────────────────────────────────────────────────────────
         p.setBrush(Qt.BrushStyle.NoBrush)
