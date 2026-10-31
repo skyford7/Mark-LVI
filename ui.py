@@ -494,6 +494,11 @@ class HudCanvas(QWidget):
     # How long a scene lingers after the work and the talking have both stopped.
     _SCENE_HOLD_S = 2.5
 
+    # Which activity scenes also colour the face. Most work is emotionally
+    # neutral; only a greeting and a problem move the expression.
+    _SCENE_EMOTION = {"greet": "happy", "alert": "concerned",
+                      "image": "pleased", "media": "pleased"}
+
     def set_activity(self, kind: str, label: str = "", prio: int = 2) -> None:
         """Show activity scene `kind` (GUI thread). A weaker signal never
         replaces a stronger one that is still on screen: what a tool is doing
@@ -512,10 +517,25 @@ class HudCanvas(QWidget):
         self._scene_label = label or _scenes.SCENES[kind][1]
         self._scene_prio = prio
         self._scene_until = now + self._SCENE_HOLD_S
+        emo = self._SCENE_EMOTION.get(kind)
+        if emo and self._avatar is not None:
+            try:
+                self._avatar.set_emotion(emo, hold=self._SCENE_HOLD_S + 3.0)
+            except Exception:
+                pass
 
     def clear_activity(self) -> None:
         """Let the current scene fade back to the face straight away."""
         self._scene_until = 0.0
+
+    def set_face_emotion(self, name: str, hold: float = 5.0) -> None:
+        """Colour the face with an emotion WITHOUT raising a scene over it, so
+        a greeting or a problem is read on the head itself while it talks."""
+        if self._avatar is not None:
+            try:
+                self._avatar.set_emotion(name, hold=hold)
+            except Exception:
+                pass
 
     def _step_scene(self, dt: float, now: float) -> None:
         if self._scene is None:
@@ -4345,6 +4365,7 @@ class MainWindow(QMainWindow):
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
     _activity_sig   = pyqtSignal(str, str, int)  # (scene kind, label, priority)
+    _emotion_sig    = pyqtSignal(str, float)     # (emotion name, hold seconds) — face only
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -4613,6 +4634,7 @@ class MainWindow(QMainWindow):
         self._log_sig.connect(self._log.append_log)
         self._state_sig.connect(self._apply_state)
         self._activity_sig.connect(self.hud.set_activity)
+        self._emotion_sig.connect(self.hud.set_face_emotion)
         self._content_sig.connect(self._show_content)
         self._reconfig_sig.connect(self._show_setup)
         self._camera_sig.connect(self._show_camera_frame)
@@ -7216,7 +7238,13 @@ class JarvisUI:
             hit = _scenes.scene_for_speech(text)
             if hit and hit[0] != self._last_speech_scene:
                 self._last_speech_scene = hit[0]
-                self._win._activity_sig.emit(hit[0], hit[1], 1)
+                # Greetings and problems belong on the face, not under a graphic
+                # that hides it. Everything else is a topic worth a scene.
+                face_only = {"greet": "happy", "alert": "concerned"}
+                if hit[0] in face_only:
+                    self._win._emotion_sig.emit(face_only[hit[0]], 6.0)
+                else:
+                    self._win._activity_sig.emit(hit[0], hit[1], 1)
         except Exception:
             pass
 
